@@ -147,15 +147,6 @@ Open the printed local URL (usually `http://localhost:8501`).
 - `src/%` → files directly under `src/`
 - `%*.py` is not valid; use `%.py`
 
----
-
-## Project Structure
-
-    devlog-analyzer/
-    ├── app.py           # Streamlit dashboard
-    ├── ingest.py        # One-pass Git → SQLite ingestor
-    ├── requirements.txt # Minimal runtime deps
-    └── devlog.db        # Generated SQLite database (after ingest)
 
 ---
 
