@@ -5,6 +5,7 @@
 # - Charts: commit volume over time, frequent authors, top changed files, file-change trend for a pattern
 
 import os
+import ui
 from datetime import date
 from typing import Optional, List
 
@@ -13,8 +14,6 @@ import streamlit as st
 import sqlalchemy as sa
 from sqlalchemy import text
 from dotenv import load_dotenv
-
-st.set_page_config(page_title="DevLog Analyzer", layout="wide")
 
 # --- Load env variables -------------------------------------------------
 load_dotenv()
@@ -113,143 +112,45 @@ def run_query(
 # --- App UI ----------------------------------------------------------------------
 
 def main():
-    st.title("DevLog Analyzer (MVP)")
+    # Set up the page
+    ui.setup_page()
 
+    # Connect to database
     try:
         engine = connect()
     except Exception as e:
-        st.error(f"Could not connect to MySQL database: {str(e)}")
-        st.info("Make sure the .env file contains the correct DB_URL and the MySQL server is running.")
-        st.stop()
+        ui.display_error_message(
+            f"Could not connect to MySQL database: {str(e)}", 
+            "Make sure the .env file contains the correct DB_URL and the MySQL server is running."
+        )
 
+    # Get metadata
     try:
         (min_d, max_d), authors, top_files = get_meta(engine)
     except Exception as e:
-        st.error(f"Error retrieving metadata from database: {str(e)}")
-        st.stop()
+        ui.display_error_message(f"Error retrieving metadata from database: {str(e)}")
     
+    # Check if we have any data
     if not min_d or not max_d:
-        st.warning("No commits in DB yet.")
-        st.stop()
+        ui.display_error_message("No commits in DB yet.")
 
-    # Default to today if we can't parse the dates
-    today = date.today()
-    
-    # Sidebar filters
-    c1, c2 = st.sidebar.columns(2)
-    try:
-        start_date = date.fromisoformat(min_d) if min_d else today
-    except (ValueError, TypeError):
-        st.warning(f"Could not parse start date: {min_d}. Using today's date.")
-        start_date = today
-        
-    try:
-        end_date = date.fromisoformat(max_d) if max_d else today
-    except (ValueError, TypeError):
-        st.warning(f"Could not parse end date: {max_d}. Using today's date.")
-        end_date = today
-        
-    start = c1.date_input("Start", value=start_date)
-    end = c2.date_input("End", value=end_date)
-    chosen_authors = st.sidebar.multiselect("Authors", options=authors, default=authors)
-
-    file_hint = st.sidebar.selectbox("Popular files (optional)", [""] + top_files, index=0)
-    file_like = st.sidebar.text_input("Or enter file pattern (SQL LIKE)", value=file_hint)
-    if file_like and "%" not in file_like and "_" not in file_like:
-        file_like = f"%{file_like}%"
-    if file_like == "":
-        file_like = None
-
-    show_errors = st.sidebar.checkbox("Show only error/fix-tagged commits")
+    # Set up sidebar filters
+    start, end, chosen_authors, file_like, show_errors = ui.setup_sidebar_filters(
+        min_d, max_d, authors, top_files
+    )
 
     # Query data
     df = run_query(engine, start.isoformat(), end.isoformat(), chosen_authors, file_like, show_errors)
     if df.empty:
-        st.warning("No commits match your filters.")
-        st.stop()
+        ui.display_error_message("No commits match your filters.")
 
-    # KPIs
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Commits", f"{len(df):,}")
-    k2.metric("Additions", int(df["additions"].sum()))
-    k3.metric("Deletions", int(df["deletions"].sum()))
-    k4.metric("Fix-tagged", int(df["is_fix"].sum()))
-
-    # Commit volume over time
-    st.subheader("Commit volume over time")
-    by_day = df.groupby("date").size().rename("commits").reset_index()
-    st.line_chart(by_day.set_index("date"))
-
-    # Frequent authors
-    st.subheader("Frequent authors")
-    top_auth = (
-        df.groupby("author_name").size()
-        .sort_values(ascending=False)
-        .head(10)
-        .rename("commits")
-        .reset_index()
-    )
-    st.bar_chart(top_auth.set_index("author_name"))
-
-    # Top changed files within current filters
-    st.subheader("Top changed files (within current filters)")
-    hashes = df["hash"].unique().tolist()
-    if hashes:
-        placeholders = [f":hash_{i}" for i in range(len(hashes))]
-        params = {f"hash_{i}": hash_val for i, hash_val in enumerate(hashes)}
-        
-        query = text(f"""
-            SELECT file_path, COUNT(*) AS commits_touching
-            FROM commit_files
-            WHERE commit_hash IN ({', '.join(placeholders)})
-            GROUP BY file_path
-            ORDER BY commits_touching DESC
-            LIMIT 10
-        """)
-        
-        with engine.connect() as conn:
-            result = conn.execute(query, params)
-            rows = result.fetchall()
-            
-        top_files_df = pd.DataFrame(rows, columns=["file_path", "commits_touching"])
-        if not top_files_df.empty:
-            st.bar_chart(top_files_df.set_index("file_path"))
-
-    # File-change trend over time (only if user set a pattern)
-    if file_like:
-        st.subheader("File-change trend over time (matching file filter)")
-        where = ["DATE(c.authored_at) BETWEEN :start_date AND :end_date"]
-        params = {"start_date": start.isoformat(), "end_date": end.isoformat()}
-
-        if chosen_authors:
-            placeholders = [f":auth_{i}" for i in range(len(chosen_authors))]
-            where.append(f"c.author_name IN ({', '.join(placeholders)})")
-            for i, author in enumerate(chosen_authors):
-                params[f"auth_{i}"] = author
-
-        where.append("f.file_path LIKE :file_pattern")
-        params["file_pattern"] = file_like
-
-        trend_sql = f"""
-          SELECT DATE(c.authored_at) AS day, COUNT(*) AS commits
-          FROM commit_files f
-          JOIN commits c ON c.hash = f.commit_hash
-          WHERE {" AND ".join(where)}
-          GROUP BY DATE(c.authored_at)
-          ORDER BY day
-        """
-        
-        with engine.connect() as conn:
-            trend_df = pd.read_sql_query(text(trend_sql), conn, params=params)
-            
-        if not trend_df.empty:
-            trend_df["day"] = pd.to_datetime(trend_df["day"])
-            st.line_chart(trend_df.set_index("day"))
-
-    # Details table
-    st.subheader("Commits (filtered)")
-    cols = ["authored_at", "author_name", "additions", "deletions", "files_changed", "is_fix", "message", "hash"]
-    st.dataframe(df[cols].sort_values("authored_at", ascending=False), use_container_width=True)
+    # Display dashboard components
+    ui.display_kpis(df)
+    ui.display_commit_volume_chart(df)
+    ui.display_author_chart(df)
+    ui.display_top_files_chart(engine, df["hash"].unique().tolist())
+    ui.display_file_trend(engine, file_like, start, end, chosen_authors)
+    ui.display_commits_table(df)
 
 if __name__ == "__main__":
     main()
