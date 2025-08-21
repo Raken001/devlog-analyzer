@@ -53,6 +53,7 @@ def run_query(
     end_iso: str,
     authors: List[str],
     file_like: Optional[str],
+    show_errors: bool = False,
 ):
     where = ["date(c.authored_at) BETWEEN ? AND ?"]
     params: List[object] = [start_iso, end_iso]
@@ -66,6 +67,9 @@ def run_query(
         join = "JOIN commit_files f ON f.commit_hash = c.hash"
         where.append("f.file_path LIKE ?")
         params.append(file_like)
+
+    if show_errors:
+        where.append("(c.is_fix = 1 OR c.error_tags LIKE '%error%' OR c.error_tags LIKE '%bug%')")
 
     sql = f"""
       SELECT c.hash, c.author_name, c.authored_at, c.additions, c.deletions,
@@ -112,8 +116,10 @@ def main():
     if file_like == "":
         file_like = None
 
+    show_errors = st.sidebar.checkbox("Show only error/fix-tagged commits")
+
     # Query data
-    df = run_query(conn, start.isoformat(), end.isoformat(), chosen_authors, file_like)
+    df = run_query(conn, start.isoformat(), end.isoformat(), chosen_authors, file_like, show_errors)
     if df.empty:
         st.warning("No commits match your filters.")
         st.stop()
