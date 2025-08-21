@@ -40,7 +40,10 @@ def get_meta(_engine):
             "SELECT MIN(DATE(authored_at)), MAX(DATE(authored_at)) FROM commits"
         ))
         row = result.fetchone()
-        min_d, max_d = row[0], row[1] if row else (None, None)
+        
+        # Convert to strings in ISO format if not None
+        min_d = row[0].isoformat() if row and row[0] else None
+        max_d = row[1].isoformat() if row and row[1] else None
 
         # Distinct authors for the multiselect
         result = conn.execute(text(
@@ -129,10 +132,25 @@ def main():
         st.warning("No commits in DB yet.")
         st.stop()
 
+    # Default to today if we can't parse the dates
+    today = date.today()
+    
     # Sidebar filters
     c1, c2 = st.sidebar.columns(2)
-    start = c1.date_input("Start", value=date.fromisoformat(min_d))
-    end = c2.date_input("End", value=date.fromisoformat(max_d))
+    try:
+        start_date = date.fromisoformat(min_d) if min_d else today
+    except (ValueError, TypeError):
+        st.warning(f"Could not parse start date: {min_d}. Using today's date.")
+        start_date = today
+        
+    try:
+        end_date = date.fromisoformat(max_d) if max_d else today
+    except (ValueError, TypeError):
+        st.warning(f"Could not parse end date: {max_d}. Using today's date.")
+        end_date = today
+        
+    start = c1.date_input("Start", value=start_date)
+    end = c2.date_input("End", value=end_date)
     chosen_authors = st.sidebar.multiselect("Authors", options=authors, default=authors)
 
     file_hint = st.sidebar.selectbox("Popular files (optional)", [""] + top_files, index=0)
