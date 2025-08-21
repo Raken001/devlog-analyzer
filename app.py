@@ -5,68 +5,86 @@
 # - Charts: commit volume over time, frequent authors, top changed files, file-change trend for a pattern
 
 import os
-import sqlite3
 from datetime import date
 from typing import Optional, List
 
 import pandas as pd
 import streamlit as st
+import sqlalchemy as sa
+from sqlalchemy import text
+from dotenv import load_dotenv
 
 st.set_page_config(page_title="DevLog Analyzer", layout="wide")
+
+# --- Load env variables -------------------------------------------------
+load_dotenv()
 
 # --- Connections & cached helpers -------------------------------------------------
 
 @st.cache_resource
-def connect(db_path: str):
-    # Keep a single connection for the app session
-    return sqlite3.connect(db_path, check_same_thread=False)
+def connect():
+    # Get connection string from environment variables
+    db_url = os.getenv("DB_URL")
+    if not db_url:
+        raise ValueError("DB_URL not found in environment variables")
+    
+    # Create SQLAlchemy engine
+    engine = sa.create_engine(db_url)
+    return engine
 
 @st.cache_data
-def get_meta(_conn):
-    # Min/max dates for defaults
-    min_d, max_d = _conn.execute(
-        "SELECT MIN(date(authored_at)), MAX(date(authored_at)) FROM commits"
-    ).fetchone() or (None, None)
+def get_meta(_engine):
+    with _engine.connect() as conn:
+        # Min/max dates for defaults
+        result = conn.execute(text(
+            "SELECT MIN(DATE(authored_at)), MAX(DATE(authored_at)) FROM commits"
+        ))
+        row = result.fetchone()
+        min_d, max_d = row[0], row[1] if row else (None, None)
 
-    # Distinct authors for the multiselect
-    authors = [r[0] for r in _conn.execute(
-        "SELECT DISTINCT author_name FROM commits ORDER BY author_name"
-    ).fetchall()]
+        # Distinct authors for the multiselect
+        result = conn.execute(text(
+            "SELECT DISTINCT author_name FROM commits ORDER BY author_name"
+        ))
+        authors = [r[0] for r in result.fetchall()]
 
-    # Popular files for a quick-select (top 50 by commits touching)
-    top_files = [r[0] for r in _conn.execute("""
-        SELECT file_path FROM (
-          SELECT file_path, COUNT(*) AS c
-          FROM commit_files
-          GROUP BY file_path
-          ORDER BY c DESC
-          LIMIT 50
-        )
-    """).fetchall()]
+        # Popular files for a quick-select (top 50 by commits touching)
+        result = conn.execute(text("""
+            SELECT file_path FROM (
+              SELECT file_path, COUNT(*) AS c
+              FROM commit_files
+              GROUP BY file_path
+              ORDER BY c DESC
+              LIMIT 50
+            ) AS subq
+        """))
+        top_files = [r[0] for r in result.fetchall()]
 
     return (min_d, max_d), authors, top_files
 
 @st.cache_data
 def run_query(
-    _conn,
+    _engine,
     start_iso: str,
     end_iso: str,
     authors: List[str],
     file_like: Optional[str],
     show_errors: bool = False,
 ):
-    where = ["date(c.authored_at) BETWEEN ? AND ?"]
-    params: List[object] = [start_iso, end_iso]
+    where = ["DATE(c.authored_at) BETWEEN :start_date AND :end_date"]
+    params = {"start_date": start_iso, "end_date": end_iso}
 
     if authors:
-        where.append("c.author_name IN ({})".format(",".join("?" * len(authors))))
-        params.extend(authors)
+        placeholders = [f":author_{i}" for i in range(len(authors))]
+        where.append(f"c.author_name IN ({', '.join(placeholders)})")
+        for i, author in enumerate(authors):
+            params[f"author_{i}"] = author
 
     join = ""
     if file_like:
         join = "JOIN commit_files f ON f.commit_hash = c.hash"
-        where.append("f.file_path LIKE ?")
-        params.append(file_like)
+        where.append("f.file_path LIKE :file_pattern")
+        params["file_pattern"] = file_like
 
     if show_errors:
         where.append("(c.is_fix = 1 OR c.error_tags LIKE '%error%' OR c.error_tags LIKE '%bug%')")
@@ -78,7 +96,9 @@ def run_query(
       {join}
       WHERE {" AND ".join(where)}
     """
-    df = pd.read_sql_query(sql, _conn, params=params)
+    
+    with _engine.connect() as conn:
+        df = pd.read_sql_query(text(sql), conn, params=params)
 
     if not df.empty:
         # Robust timezone-safe parsing, then drop tz and keep calendar date
@@ -92,13 +112,19 @@ def run_query(
 def main():
     st.title("DevLog Analyzer (MVP)")
 
-    db_path = st.sidebar.text_input("SQLite DB path", "devlog.db")
-    if not os.path.exists(db_path):
-        st.info("DB not found. Run an ingestor first (e.g., `python ingest_files.py <repo>`).")
+    try:
+        engine = connect()
+    except Exception as e:
+        st.error(f"Could not connect to MySQL database: {str(e)}")
+        st.info("Make sure the .env file contains the correct DB_URL and the MySQL server is running.")
         st.stop()
 
-    conn = connect(db_path)
-    (min_d, max_d), authors, top_files = get_meta(conn)
+    try:
+        (min_d, max_d), authors, top_files = get_meta(engine)
+    except Exception as e:
+        st.error(f"Error retrieving metadata from database: {str(e)}")
+        st.stop()
+    
     if not min_d or not max_d:
         st.warning("No commits in DB yet.")
         st.stop()
@@ -119,7 +145,7 @@ def main():
     show_errors = st.sidebar.checkbox("Show only error/fix-tagged commits")
 
     # Query data
-    df = run_query(conn, start.isoformat(), end.isoformat(), chosen_authors, file_like, show_errors)
+    df = run_query(engine, start.isoformat(), end.isoformat(), chosen_authors, file_like, show_errors)
     if df.empty:
         st.warning("No commits match your filters.")
         st.stop()
@@ -149,20 +175,24 @@ def main():
 
     # Top changed files within current filters
     st.subheader("Top changed files (within current filters)")
-    hashes = tuple(df["hash"].unique().tolist())
+    hashes = df["hash"].unique().tolist()
     if hashes:
-        q_marks = ",".join("?" * len(hashes))
-        rows = conn.execute(
-            f"""
+        placeholders = [f":hash_{i}" for i in range(len(hashes))]
+        params = {f"hash_{i}": hash_val for i, hash_val in enumerate(hashes)}
+        
+        query = text(f"""
             SELECT file_path, COUNT(*) AS commits_touching
             FROM commit_files
-            WHERE commit_hash IN ({q_marks})
+            WHERE commit_hash IN ({', '.join(placeholders)})
             GROUP BY file_path
             ORDER BY commits_touching DESC
             LIMIT 10
-            """,
-            hashes,
-        ).fetchall()
+        """)
+        
+        with engine.connect() as conn:
+            result = conn.execute(query, params)
+            rows = result.fetchall()
+            
         top_files_df = pd.DataFrame(rows, columns=["file_path", "commits_touching"])
         if not top_files_df.empty:
             st.bar_chart(top_files_df.set_index("file_path"))
@@ -170,25 +200,30 @@ def main():
     # File-change trend over time (only if user set a pattern)
     if file_like:
         st.subheader("File-change trend over time (matching file filter)")
-        where = ["date(c.authored_at) BETWEEN ? AND ?"]
-        params: List[object] = [start.isoformat(), end.isoformat()]
+        where = ["DATE(c.authored_at) BETWEEN :start_date AND :end_date"]
+        params = {"start_date": start.isoformat(), "end_date": end.isoformat()}
 
         if chosen_authors:
-            where.append("c.author_name IN ({})".format(",".join("?" * len(chosen_authors))))
-            params.extend(chosen_authors)
+            placeholders = [f":auth_{i}" for i in range(len(chosen_authors))]
+            where.append(f"c.author_name IN ({', '.join(placeholders)})")
+            for i, author in enumerate(chosen_authors):
+                params[f"auth_{i}"] = author
 
-        where.append("f.file_path LIKE ?")
-        params.append(file_like)
+        where.append("f.file_path LIKE :file_pattern")
+        params["file_pattern"] = file_like
 
         trend_sql = f"""
-          SELECT date(c.authored_at) AS day, COUNT(*) AS commits
+          SELECT DATE(c.authored_at) AS day, COUNT(*) AS commits
           FROM commit_files f
           JOIN commits c ON c.hash = f.commit_hash
           WHERE {" AND ".join(where)}
-          GROUP BY date(c.authored_at)
+          GROUP BY DATE(c.authored_at)
           ORDER BY day
         """
-        trend_df = pd.read_sql_query(trend_sql, conn, params=params)
+        
+        with engine.connect() as conn:
+            trend_df = pd.read_sql_query(text(trend_sql), conn, params=params)
+            
         if not trend_df.empty:
             trend_df["day"] = pd.to_datetime(trend_df["day"])
             st.line_chart(trend_df.set_index("day"))
